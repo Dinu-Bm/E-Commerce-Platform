@@ -1,0 +1,36 @@
+#!/bin/bash
+set -euxo pipefail
+
+# Amazon Linux 2023 uses dnf
+dnf update -y || true
+dnf install -y docker awscli || (yum install -y docker awscli || true)
+systemctl enable docker
+systemctl start docker
+
+REGION="$(curl -s http://169.254.169.254/latest/meta-data/placement/region)"
+aws ecr get-login-password --region "$REGION" | docker login --username AWS --password-stdin ${ecr_repo_url%%/*}
+
+IMAGE="${ecr_repo_url}:${image_tag}"
+docker pull "$IMAGE" || (sleep 10 && docker pull "$IMAGE")
+
+docker ps -q --filter "name=product-api" | xargs --no-run-if-empty docker stop || true
+docker ps -aq --filter "name=product-api" | xargs --no-run-if-empty docker rm || true
+
+docker run -d --name product-api -p ${app_port}:${app_port} -e PORT=${app_port} "$IMAGE"
+
+cat >/etc/systemd/system/product-api.service <<'UNIT'
+[Unit]
+Description=Product API container
+After=docker.service
+Requires=docker.service
+
+[Service]
+Restart=always
+ExecStart=/usr/bin/docker start -a product-api
+ExecStop=/usr/bin/docker stop -t 10 product-api
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+systemctl enable product-api

@@ -1,0 +1,12 @@
+variable "name_prefix" { type = string }
+variable "color" { type = string }
+variable "vpc_id" { type = string }
+variable "private_subnet_ids" { type = list(string) }
+variable "app_sg_id" { type = string }
+variable "target_group_arn" { type = string }
+variable "instance_type" { type = string }
+variable "desired_capacity" { type = number }
+variable "iam_instance_profile" { type = string }
+variable "ecr_repo_url" { type = string }
+variable "container_image_tag" { type = string }
+variable "app_port" { type = number }

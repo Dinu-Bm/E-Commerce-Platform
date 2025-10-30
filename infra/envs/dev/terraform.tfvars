@@ -1,0 +1,10 @@
+project                   = "ha-ecom"
+env                       = "dev"
+aws_region                = "ap-south-1"
+db_username               = "ecomuser"
+db_password               = "ecompass123!"
+instance_type             = "t3.micro"
+desired_capacity_active   = 2
+desired_capacity_inactive = 0
+active_color              = "blue"
+container_image_tag       = "latest"

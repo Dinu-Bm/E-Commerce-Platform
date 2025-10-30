@@ -1,0 +1,118 @@
+pipeline {
+  agent any
+
+  parameters {
+    choice(name: 'DEPLOY_COLOR', choices: ['green','blue'], description: 'Which color to deploy (new version)')
+    string(name: 'IMAGE_TAG', defaultValue: 'build-${BUILD_NUMBER}', description: 'Docker image tag to deploy')
+    choice(name: 'ENV', choices: ['dev'], description: 'Environment')
+  }
+
+  environment {
+    AWS_DEFAULT_REGION = 'ap-south-1'
+    TF_WORKDIR = "infra/envs/${params.ENV}"
+    PATH = "/usr/local/bin:/usr/bin:/bin:/usr/sbin"
+  }
+
+  options { timestamps() }
+
+  stages {
+    stage('Checkout') {
+      steps { checkout scm }
+    }
+
+    stage('Node Tests') {
+      steps {
+        dir('app/product-api') {
+          sh 'npm ci'
+          sh 'npm test'
+        }
+      }
+    }
+
+    stage('Docker Build & Push (ECR)') {
+      steps {
+        withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: 'aws-creds']]) {
+          sh '''
+            set -eux
+            REPO=$(terraform -chdir=$TF_WORKDIR output -raw ecr_repo_url)
+            echo "ECR: $REPO"
+            aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin ${REPO%%/*}
+            docker build -t $REPO:${IMAGE_TAG} app/product-api
+            docker push $REPO:${IMAGE_TAG}
+            docker tag $REPO:${IMAGE_TAG} $REPO:latest
+            docker push $REPO:latest
+          '''
+        }
+      }
+    }
+
+    stage('Prepare Inactive Color') {
+      steps {
+        withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: 'aws-creds']]) {
+          sh '''
+            set -eux
+            color=${DEPLOY_COLOR}
+            if [ "$color" = "blue" ]; then ACTIVE_COLOR=green; else ACTIVE_COLOR=blue; fi
+            terraform -chdir=$TF_WORKDIR init -input=false
+            terraform -chdir=$TF_WORKDIR apply -auto-approve                   -var="active_color=$ACTIVE_COLOR"                   -var="desired_capacity_active=2"                   -var="desired_capacity_inactive=0"
+          '''
+        }
+      }
+    }
+
+    stage('Scale Up New Color With Tag') {
+      steps {
+        withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: 'aws-creds']]) {
+          sh '''
+            set -eux
+            terraform -chdir=$TF_WORKDIR apply -auto-approve                   -var="active_color=${DEPLOY_COLOR}"                   -var="desired_capacity_active=2"                   -var="desired_capacity_inactive=0"                   -var="aws_region=$AWS_DEFAULT_REGION"                   -var="instance_type=t3.micro"                   -var="container_image_tag=${IMAGE_TAG}"
+          '''
+        }
+      }
+    }
+
+    stage('Health Check new Target Group') {
+      steps {
+        withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: 'aws-creds']]) {
+          sh '''
+            set -eux
+            TG_BLUE=$(terraform -chdir=$TF_WORKDIR output -raw tg_blue_arn)
+            TG_GREEN=$(terraform -chdir=$TF_WORKDIR output -raw tg_green_arn)
+            if [ "${DEPLOY_COLOR}" = "blue" ]; then TG="$TG_BLUE"; else TG="$TG_GREEN"; fi
+            ./ci/wait_for_tg_healthy.sh "$TG" "$AWS_DEFAULT_REGION"
+          '''
+        }
+      }
+    }
+
+    stage('Swap Traffic (Blue-Green)') {
+      steps {
+        withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: 'aws-creds']]) {
+          sh '''
+            set -eux
+            LISTENER=$(terraform -chdir=$TF_WORKDIR output -raw listener_arn)
+            TG_BLUE=$(terraform -chdir=$TF_WORKDIR output -raw tg_blue_arn)
+            TG_GREEN=$(terraform -chdir=$TF_WORKDIR output -raw tg_green_arn)
+            ./ci/blue_green_swap.sh "${DEPLOY_COLOR}" "$LISTENER" "$TG_BLUE" "$TG_GREEN" "$AWS_DEFAULT_REGION"
+          '''
+        }
+      }
+    }
+
+    stage('Scale down old color') {
+      steps {
+        withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: 'aws-creds']]) {
+          sh '''
+            set -eux
+            terraform -chdir=$TF_WORKDIR apply -auto-approve                   -var="active_color=${DEPLOY_COLOR}"                   -var="desired_capacity_active=2"                   -var="desired_capacity_inactive=0"
+          '''
+        }
+      }
+    }
+  }
+
+  post {
+    success { echo "Deployment complete. Color now active: ${params.DEPLOY_COLOR}" }
+    failure { echo "Deployment failed. Check logs." }
+  }
+}
